@@ -1,0 +1,101 @@
+---
+
+# 1. Check RPM database health
+- name: Check RPM database health
+  shell: rpm --verifydb
+  register: rpm_verifydb
+  ignore_errors: true
+
+# 2. Find RPM DB lock/corrupt files
+- name: Find RPM DB lock/corrupt files
+  find:
+    paths: "{{ rpm_db_path }}"
+    patterns: "{{ rpm_db_lock_files }}"
+  register: rpm_db_locks
+
+# 3. Remove RPM DB lock/corrupt files if found
+- name: Remove RPM DB lock/corrupt files if found
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ rpm_db_locks.files }}"
+  when: rpm_db_locks.matched > 0
+
+# 4. Check for missing or zero-length RPM DB files
+- name: Stat RPM DB files
+  stat:
+    path: "{{ rpm_db_path }}/{{ item }}"
+  loop: "{{ rpm_db_files }}"
+  register: rpm_db_stats
+
+- name: Set fact for missing or zero-length RPM DB files
+  set_fact:
+    rpm_db_missing_or_empty: "{{ rpm_db_stats.results | selectattr('stat.exists', 'equalto', False) | list + rpm_db_stats.results | selectattr('stat.size', 'equalto', 0) | list }}"
+
+# 5. Attempt to restore missing/empty files from backup if available
+- name: Attempt restore from backup if files missing/empty
+  copy:
+    src: "/var/lib/rpm-backup/{{ item.item }}"
+    dest: "{{ rpm_db_path }}/{{ item.item }}"
+    remote_src: yes
+  loop: "{{ rpm_db_missing_or_empty }}"
+  when: rpm_db_missing_or_empty | length > 0 and ansible_facts['distribution'] in ['RedHat', 'CentOS', 'Fedora']
+  ignore_errors: true
+
+# 6. Check/fix SELinux context
+- name: Check SELinux status
+  command: getenforce
+  register: selinux_status
+  changed_when: false
+  ignore_errors: true
+
+- name: Fix SELinux context on RPM DB
+  command: restorecon -Rv {{ rpm_db_path }}
+  when: selinux_status.stdout == 'Enforcing'
+  ignore_errors: true
+
+# 7. Check/fix permissions on RPM DB files
+- name: Fix permissions on RPM DB files
+  file:
+    path: "{{ rpm_db_path }}/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ rpm_db_files }}"
+  ignore_errors: true
+
+# 8. Check disk space
+- name: Check disk space for RPM DB
+  shell: df -h {{ rpm_db_path }}
+  register: rpm_db_diskspace
+  changed_when: false
+  ignore_errors: true
+
+# 9. Rebuild RPM database if unhealthy or lock files found
+- name: Rebuild RPM database if unhealthy or lock files found
+  shell: rpm --rebuilddb
+  when: rpm_verifydb.rc != 0 or rpm_db_locks.matched > 0 or rpm_db_missing_or_empty | length > 0
+  register: rpm_rebuilddb
+  ignore_errors: true
+
+# 10. If still unhealthy, attempt to reinstall rpm package
+- name: Check RPM DB health after fixes
+  shell: rpm --verifydb
+  register: rpm_verifydb_postfix
+  ignore_errors: true
+
+- name: Attempt to reinstall rpm package if DB still unhealthy
+  yum:
+    name: rpm
+    state: reinstalled
+  when: rpm_verifydb_postfix.rc != 0
+  ignore_errors: true
+
+# 11. Final report
+- name: Report RPM DB status
+  debug:
+    msg: |
+      RPM DB health check (initial): {{ rpm_verifydb.stdout | default('No output') }}
+      RPM DB health check (final): {{ rpm_verifydb_postfix.stdout | default('No output') }}
+      RPM DB rebuild: {{ rpm_rebuilddb.stdout | default('No rebuild needed') }}
+      Disk space: {{ rpm_db_diskspace.stdout | default('No output') }}

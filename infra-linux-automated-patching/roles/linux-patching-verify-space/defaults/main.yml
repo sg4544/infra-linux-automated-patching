@@ -1,0 +1,13 @@
+---
+# Default variables for linux-patching-verify-space
+min_free_space_root_mb: 500
+min_free_space_var_mb: 500
+min_free_space_boot_mb: 100
+kernel_keep_count: 2
+journal_vacuum_size: 100M
+journal_vacuum_time: 7d
+aggressive_cleanup: true
+notify_email: "root@localhost"
+additional_log_dirs:
+	- path: /var/spool/postfix/maildrop
+		retention_days: 30

@@ -1,0 +1,555 @@
+---
+# tasks/main.yml - Secure, best-practice disk space verification and recovery
+
+- name: Check for notify-only tag
+  set_fact:
+    notify_only_mode: true
+  when: "'notify-only' in ansible_run_tags"
+
+- name: Get list of packages to be updated
+  ansible.builtin.shell: dnf check-update --refresh | awk '/^kernel/ {print $1}'
+  register: kernel_update_list
+  changed_when: false
+  ignore_errors: true
+
+- name: Get required space for kernel update (if any)
+  ansible.builtin.shell: rpm -q --qf '%{SIZE}\n' kernel | sort -nr | head -1
+  register: kernel_size
+  when: kernel_update_list.stdout != ''
+  changed_when: false
+  ignore_errors: true
+
+- name: Get available space in /, /var, /boot
+  ansible.builtin.command: df -Pm /
+  register: root_space
+  changed_when: false
+
+- name: Get available space in /var
+  ansible.builtin.command: df -Pm /var
+  register: var_space
+  changed_when: false
+
+- name: Get available space in /boot
+  ansible.builtin.command: df -Pm /boot
+  register: boot_space
+  changed_when: false
+
+- name: Set fact for available space
+  set_fact:
+    root_free_mb: "{{ root_space.stdout_lines[-1].split()[3]|int }}"
+    var_free_mb: "{{ var_space.stdout_lines[-1].split()[3]|int }}"
+    boot_free_mb: "{{ boot_space.stdout_lines[-1].split()[3]|int }}"
+
+- name: Calculate required space for update
+  set_fact:
+    required_boot_mb: "{{ (kernel_size.stdout|int // 1024 // 1024) + 50 if kernel_update_list.stdout != '' else min_free_space_boot_mb }}"
+    required_root_mb: "{{ min_free_space_root_mb }}"
+    required_var_mb: "{{ min_free_space_var_mb }}"
+
+- name: Check if space is sufficient
+  fail:
+    msg: "Insufficient space: /={{ root_free_mb }}MB, /var={{ var_free_mb }}MB, /boot={{ boot_free_mb }}MB. Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB. Attempting cleanup."
+  when: root_free_mb < required_root_mb or var_free_mb < required_var_mb or boot_free_mb < required_boot_mb
+
+# Notify-only logic
+- name: Send notification email if space is below threshold (notify-only)
+  mail:
+    host: localhost
+    port: 25
+    to: "{{ notify_email }}"
+    subject: "[linux-patching-verify-space] Low disk space alert on {{ ansible_hostname }}"
+    body: |
+      Hostname: {{ ansible_hostname }}
+      Date: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+      Free space:
+        /      : {{ root_free_mb }} MB (min required: {{ min_free_space_root_mb }} MB)
+        /var   : {{ var_free_mb }} MB (min required: {{ min_free_space_var_mb }} MB)
+        /boot  : {{ boot_free_mb }} MB (min required: {{ min_free_space_boot_mb }} MB)
+      Action: Notification only. No cleanup performed.
+  when: notify_only_mode | default(false) and (root_free_mb < min_free_space_root_mb or var_free_mb < min_free_space_var_mb or boot_free_mb < min_free_space_boot_mb)
+
+- name: End play if notify-only mode
+  meta: end_play
+  when: notify_only_mode | default(false)
+
+# Cleanup steps (run only if space is insufficient)
+- name: Run logrotate
+  ansible.builtin.command:
+    cmd: logrotate -f /etc/logrotate.conf
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Clean package manager cache
+  ansible.builtin.dnf:
+    name: "*"
+    state: cleaned
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove old journal logs
+  ansible.builtin.command:
+    cmd: journalctl --vacuum-size={{ journal_vacuum_size }} --vacuum-time={{ journal_vacuum_time }}
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Find old mail spool files
+  ansible.builtin.find:
+    paths: /var/spool/mail
+    age: 30d
+  register: mail_spool_files
+  when: var_free_mb < required_var_mb
+
+- name: Remove old mail spool files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ mail_spool_files.files }}"
+  when: var_free_mb < required_var_mb and mail_spool_files.matched > 0
+  ignore_errors: true
+
+- name: Find and remove unused crash dumps
+  ansible.builtin.find:
+    paths: /var/crash
+    age: 30d
+  register: crash_files
+  when: var_free_mb < required_var_mb
+
+- name: Remove unused crash dumps
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ crash_files.files }}"
+  when: var_free_mb < required_var_mb and crash_files.matched > 0
+  ignore_errors: true
+
+- name: Find and remove old audit logs
+  ansible.builtin.find:
+    paths: /var/log/audit
+    age: 30d
+  register: audit_files
+  when: var_free_mb < required_var_mb
+
+- name: Remove old audit logs
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ audit_files.files }}"
+  when: var_free_mb < required_var_mb and audit_files.matched > 0
+  ignore_errors: true
+
+- name: Remove orphaned RPMs
+  ansible.builtin.command:
+    cmd: package-cleanup --leaves
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove unused packages
+  ansible.builtin.dnf:
+    autoremove: yes
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Find and remove files in /tmp and /var/tmp
+  ansible.builtin.find:
+    paths:
+    - /tmp
+    - /var/tmp
+    age: 7d
+  register: tmp_files
+  when: root_free_mb < required_root_mb or var_free_mb < required_var_mb
+
+- name: Remove files in /tmp and /var/tmp
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ tmp_files.files }}"
+  when: (root_free_mb < required_root_mb or var_free_mb < required_var_mb) and tmp_files.matched > 0
+  ignore_errors: true
+
+- name: Remove old kernels from /boot (safe)
+  ansible.builtin.shell: |
+    running_kernel=$(uname -r)
+    for k in $(rpm -q kernel | grep -v $running_kernel | head -n -{{ kernel_keep_count }}); do
+      rpm -e $k
+    done
+  when: boot_free_mb < required_boot_mb and kernel_update_list.stdout != ''
+  ignore_errors: true
+
+- name: Find and remove duplicate/unused initramfs images
+  ansible.builtin.find:
+    paths: /boot
+    patterns: 'initramfs-*'
+    age: 30d
+  register: initramfs_files
+  when: boot_free_mb < required_boot_mb
+
+- name: Remove duplicate/unused initramfs images
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ initramfs_files.files }}"
+  when: boot_free_mb < required_boot_mb and initramfs_files.matched > 0
+  ignore_errors: true
+
+- name: Find and remove rescue kernels
+  ansible.builtin.find:
+    paths: /boot
+    patterns: 'vmlinuz-rescue-*'
+    age: 30d
+  register: rescue_files
+  when: boot_free_mb < required_boot_mb
+
+- name: Remove rescue kernels
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ rescue_files.files }}"
+  when: boot_free_mb < required_boot_mb and rescue_files.matched > 0
+  ignore_errors: true
+
+- name: Remove unused containers/images
+  ansible.builtin.command:
+    cmd: docker system prune -af || podman system prune -af
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Find and remove old backups/ISOs
+  ansible.builtin.find:
+    paths: /
+    patterns:
+    - '*.iso'
+    - '*backup*'
+    age: 30d
+  register: backup_files
+  when: root_free_mb < required_root_mb
+
+- name: Remove old backups/ISOs
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ backup_files.files }}"
+  when: root_free_mb < required_root_mb and backup_files.matched > 0
+  ignore_errors: true
+
+- name: Remove old LVM snapshots (safe)
+  community.general.lvol:
+    vg: "{{ item.vg }}"
+    lv: "{{ item.lv }}"
+    state: absent
+  loop: "{{ query('community.general.lvol', 'state=present') | selectattr('lv', 'search', 'snapshot') | list }}"
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Find and clean up unused user files in /home
+  ansible.builtin.find:
+    paths: /home
+    age: 180d
+  register: home_files
+  when: root_free_mb < required_root_mb and aggressive_cleanup
+
+- name: Remove unused user files in /home
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ home_files.files }}"
+  when: root_free_mb < required_root_mb and aggressive_cleanup and home_files.matched > 0
+  ignore_errors: true
+
+# LVM detection and extension logic (run after cleanup if space is still insufficient)
+- name: Gather facts for LVM extension
+  setup:
+    gather_subset:
+    - hardware
+    - network
+    - virtual
+    - lvm
+
+- name: Extend LVM logical volume and filesystem if possible
+  community.general.lvol:
+    vg: "{{ item.vg }}"
+    lv: "{{ item.lv }}"
+    size: "+1G"
+    resizefs: yes
+    state: present
+  loop: "{{ ansible_lvm.lvs | selectattr('lv', 'in', ['root', 'var', 'boot']) | list }}"
+  when: (root_free_mb < required_root_mb or var_free_mb < required_var_mb or boot_free_mb < required_boot_mb) and ansible_lvm.vgs is defined
+  ignore_errors: true
+
+- name: Re-check available space after cleanup
+  ansible.builtin.command: df -Pm /
+  register: root_space_post
+  changed_when: false
+
+- name: Re-check available space in /var
+  ansible.builtin.command: df -Pm /var
+  register: var_space_post
+  changed_when: false
+
+- name: Re-check available space in /boot
+  ansible.builtin.command: df -Pm /boot
+  register: boot_space_post
+  changed_when: false
+
+- name: Set fact for available space after cleanup
+  set_fact:
+    root_free_mb_post: "{{ root_space_post.stdout_lines[-1].split()[3]|int }}"
+    var_free_mb_post: "{{ var_space_post.stdout_lines[-1].split()[3]|int }}"
+    boot_free_mb_post: "{{ boot_space_post.stdout_lines[-1].split()[3]|int }}"
+
+- name: Final check if space is sufficient
+  fail:
+    msg: "Insufficient space after cleanup: /={{ root_free_mb_post }}MB, /var={{ var_free_mb_post }}MB, /boot={{ boot_free_mb_post }}MB. Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB. Please investigate manually."
+  when: root_free_mb_post < required_root_mb or var_free_mb_post < required_var_mb or boot_free_mb_post < required_boot_mb
+
+- name: Report disk space status
+  debug:
+    msg: |
+      Disk space before cleanup: /={{ root_free_mb }}MB, /var={{ var_free_mb }}MB, /boot={{ boot_free_mb }}MB
+      Disk space after cleanup: /={{ root_free_mb_post }}MB, /var={{ var_free_mb_post }}MB, /boot={{ boot_free_mb_post }}MB
+      Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB
+      Kernel update required: {{ kernel_update_list.stdout | default('No') }}
+---
+# tasks/main.yml - Check and recover disk space before patching
+
+- name: Check for notify-only tag
+  set_fact:
+    notify_only_mode: true
+  when: "'notify-only' in ansible_run_tags"
+
+- name: Get list of packages to be updated
+  shell: dnf check-update --refresh | awk '/^kernel/ {print $1}'
+  register: kernel_update_list
+  changed_when: false
+  ignore_errors: true
+
+- name: Get required space for kernel update (if any)
+  shell: rpm -q --qf '%{SIZE}\n' kernel | sort -nr | head -1
+  register: kernel_size
+  when: kernel_update_list.stdout != ''
+  changed_when: false
+  ignore_errors: true
+
+- name: Get available space in /, /var, /boot
+  shell: |
+    df -Pm / | tail -1 | awk '{print $4}'
+    df -Pm /var | tail -1 | awk '{print $4}'
+    df -Pm /boot | tail -1 | awk '{print $4}'
+  register: disk_space
+  changed_when: false
+
+- name: Get available space in /, /var, /boot (notify-only)
+  shell: |
+    df -Pm / | tail -1 | awk '{print $4}'
+    df -Pm /var | tail -1 | awk '{print $4}'
+    df -Pm /boot | tail -1 | awk '{print $4}'
+  register: disk_space_notify
+  changed_when: false
+  when: notify_only_mode | default(false)
+
+- name: Set fact for available space (notify-only)
+  set_fact:
+    root_free_mb_notify: "{{ disk_space_notify.stdout_lines[0]|int }}"
+    var_free_mb_notify: "{{ disk_space_notify.stdout_lines[1]|int }}"
+    boot_free_mb_notify: "{{ disk_space_notify.stdout_lines[2]|int }}"
+  when: notify_only_mode | default(false)
+
+- name: Send notification email if space is below threshold (notify-only)
+  mail:
+    host: localhost
+    port: 25
+    to: "{{ notify_email }}"
+    subject: "[linux-patching-verify-space] Low disk space alert on {{ ansible_hostname }}"
+    body: |
+      Hostname: {{ ansible_hostname }}
+      Date: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+      Free space:
+        /      : {{ root_free_mb_notify }} MB (min required: {{ min_free_space_root_mb }} MB)
+        /var   : {{ var_free_mb_notify }} MB (min required: {{ min_free_space_var_mb }} MB)
+        /boot  : {{ boot_free_mb_notify }} MB (min required: {{ min_free_space_boot_mb }} MB)
+      Action: Notification only. No cleanup performed.
+  when: notify_only_mode | default(false) and (root_free_mb_notify < min_free_space_root_mb or var_free_mb_notify < min_free_space_var_mb or boot_free_mb_notify < min_free_space_boot_mb)
+
+- name: End play if notify-only mode
+  meta: end_play
+  when: notify_only_mode | default(false)
+
+- name: Set fact for available space
+  set_fact:
+    root_free_mb: "{{ disk_space.stdout_lines[0]|int }}"
+    var_free_mb: "{{ disk_space.stdout_lines[1]|int }}"
+    boot_free_mb: "{{ disk_space.stdout_lines[2]|int }}"
+
+- name: Calculate required space for update
+  set_fact:
+    required_boot_mb: "{{ (kernel_size.stdout|int // 1024 // 1024) + 50 if kernel_update_list.stdout != '' else min_free_space_boot_mb }}"
+    required_root_mb: "{{ min_free_space_root_mb }}"
+    required_var_mb: "{{ min_free_space_var_mb }}"
+
+- name: Check if space is sufficient
+  fail:
+    msg: "Insufficient space: /={{ root_free_mb }}MB, /var={{ var_free_mb }}MB, /boot={{ boot_free_mb }}MB. Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB. Attempting cleanup."
+  when: root_free_mb < required_root_mb or var_free_mb < required_var_mb or boot_free_mb < required_boot_mb
+
+## LVM detection and extension logic (run after cleanup if space is still insufficient)
+
+- name: Detect LVM for /, /var, /boot
+  shell: |
+    df -P | grep -E ' /$| /var$| /boot$' | awk '{print $1}'
+  register: lvm_mounts
+  changed_when: false
+  ignore_errors: true
+
+- name: Get LV and VG info for each mount
+  shell: |
+    for dev in {{ lvm_mounts.stdout_lines | join(' ') }}; do
+      lvdisplay $dev 2>/dev/null | grep 'LV Path' | awk '{print $3}'
+      lvdisplay $dev 2>/dev/null | grep 'VG Name' | awk '{print $3}'
+    done
+  register: lvm_info
+  changed_when: false
+  ignore_errors: true
+
+- name: Get VG free space
+  shell: |
+    for vg in $(vgs --noheadings -o vg_name); do
+      vgs $vg --noheadings -o vg_free | awk '{print $1}'
+    done
+  register: vg_free
+  changed_when: false
+  ignore_errors: true
+
+- name: Extend LV and filesystem if VG has free space and FS is LVM
+  shell: |
+    # Example: extend / by 1G if VG has space
+    for dev in {{ lvm_mounts.stdout_lines | join(' ') }}; do
+      lv=$(lvdisplay $dev 2>/dev/null | grep 'LV Path' | awk '{print $3}')
+      vg=$(lvdisplay $dev 2>/dev/null | grep 'VG Name' | awk '{print $3}')
+      free=$(vgs $vg --noheadings -o vg_free | awk '{print $1}' | sed 's/[a-zA-Z]//g')
+      if [ "$free" -gt 1024 ]; then
+        lvextend -L+1G $lv
+        mountpoint=$(df | grep $dev | awk '{print $6}')
+        fstype=$(df -T $dev | tail -1 | awk '{print $2}')
+        if [ "$fstype" = "xfs" ]; then
+          xfs_growfs $mountpoint
+        else
+          resize2fs $dev
+        fi
+      fi
+    done
+  when: (root_free_mb_post < required_root_mb or var_free_mb_post < required_var_mb or boot_free_mb_post < required_boot_mb) and vg_free.stdout != ''
+  ignore_errors: true
+- name: Run logrotate
+  command: logrotate -f /etc/logrotate.conf
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Clean package manager cache
+  shell: dnf clean all || yum clean all
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove old journal logs
+  shell: journalctl --vacuum-size={{ journal_vacuum_size }} --vacuum-time={{ journal_vacuum_time }}
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Delete old mail spools
+  file:
+    path: /var/spool/mail
+    state: absent
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove unused crash dumps
+  file:
+    path: /var/crash
+    state: absent
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Purge old audit logs
+  file:
+    path: /var/log/audit
+    state: absent
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove orphaned RPMs
+  shell: package-cleanup --leaves
+  when: var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove unused packages
+  shell: dnf autoremove -y || yum autoremove -y
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Delete files in /tmp and /var/tmp
+  shell: rm -rf /tmp/* /var/tmp/*
+  when: root_free_mb < required_root_mb or var_free_mb < required_var_mb
+  ignore_errors: true
+
+- name: Remove old kernels from /boot
+  shell: |
+    running_kernel=$(uname -r)
+    kernels=$(rpm -q kernel | grep -v $running_kernel | head -n -{{ kernel_keep_count }})
+    for k in $kernels; do rpm -e $k; done
+  when: boot_free_mb < required_boot_mb and kernel_update_list.stdout != ''
+  ignore_errors: true
+
+- name: Remove duplicate/unused initramfs images
+  shell: find /boot -name 'initramfs-*' -type f -mtime +30 -delete
+  when: boot_free_mb < required_boot_mb
+  ignore_errors: true
+
+- name: Remove rescue kernels
+  shell: find /boot -name 'vmlinuz-rescue-*' -type f -delete
+  when: boot_free_mb < required_boot_mb
+  ignore_errors: true
+
+- name: Remove unused containers/images
+  shell: docker system prune -af || podman system prune -af
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Remove old backups/ISOs
+  shell: find / -type f \( -name '*.iso' -o -name '*backup*' \) -delete
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Remove old LVM snapshots
+  shell: lvremove -f $(lvs --noheadings -o lv_name | grep snapshot)
+  when: root_free_mb < required_root_mb
+  ignore_errors: true
+
+- name: Clean up unused user files in /home
+  shell: find /home -type f -mtime +180 -delete
+  when: root_free_mb < required_root_mb and aggressive_cleanup
+  ignore_errors: true
+
+- name: Re-check available space after cleanup
+  shell: |
+    df -Pm / | tail -1 | awk '{print $4}'
+    df -Pm /var | tail -1 | awk '{print $4}'
+    df -Pm /boot | tail -1 | awk '{print $4}'
+  register: disk_space_post
+  changed_when: false
+
+- name: Set fact for available space after cleanup
+  set_fact:
+    root_free_mb_post: "{{ disk_space_post.stdout_lines[0]|int }}"
+    var_free_mb_post: "{{ disk_space_post.stdout_lines[1]|int }}"
+    boot_free_mb_post: "{{ disk_space_post.stdout_lines[2]|int }}"
+
+- name: Final check if space is sufficient
+  fail:
+    msg: "Insufficient space after cleanup: /={{ root_free_mb_post }}MB, /var={{ var_free_mb_post }}MB, /boot={{ boot_free_mb_post }}MB. Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB. Please investigate manually."
+  when: root_free_mb_post < required_root_mb or var_free_mb_post < required_var_mb or boot_free_mb_post < required_boot_mb
+
+- name: Report disk space status
+  debug:
+    msg: |
+      Disk space before cleanup: /={{ root_free_mb }}MB, /var={{ var_free_mb }}MB, /boot={{ boot_free_mb }}MB
+      Disk space after cleanup: /={{ root_free_mb_post }}MB, /var={{ var_free_mb_post }}MB, /boot={{ boot_free_mb_post }}MB
+      Required: /={{ required_root_mb }}MB, /var={{ required_var_mb }}MB, /boot={{ required_boot_mb }}MB
+      Kernel update required: {{ kernel_update_list.stdout | default('No') }}

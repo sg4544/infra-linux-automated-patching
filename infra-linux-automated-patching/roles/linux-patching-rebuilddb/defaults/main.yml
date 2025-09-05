@@ -1,0 +1,15 @@
+---
+# Default variables for linux-patching-rebuilddb
+rpm_db_path: /var/lib/rpm
+rpm_db_files:
+- Packages
+- Name
+- Basenames
+- Providename
+- Requirename
+- Sha1header
+- Sigmd5
+rpm_db_lock_files:
+- __db.001
+- __db.002
+- __db.003
